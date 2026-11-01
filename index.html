@@ -12,7 +12,7 @@
 <p class="small">For eksempel: originalspor 2,40 mm, gammel plate 2,25 mm → klaring 0,15 mm. Nytt spor blir 3,15 mm. Laserens kerf kan kreve en test.</p>
 <button id="scan" disabled>Finn mulige spor</button><button id="apply" disabled>Tilpass valgte spor</button><button id="download" disabled>Last ned endret SVG</button><button class="secondary" id="reset" disabled>Nullstill</button>
 <div id="status" role="status">Last opp en SVG for å begynne.</div></section>
-<section><strong>2. Kontroller markeringene</strong><p class="small">Røde rektangler er valgt for endring. Klikk et rektangel for å velge eller fjerne det. Programmet endrer bare enkle, aksejusterte SVG-rektangler (<code>&lt;rect&gt;</code>). Spor tegnet som stier (<code>&lt;path&gt;</code>), roterte figurer, tapper og kompliserte skjøter blir ikke automatisk endret. Kontroller alltid filen i LightBurn før skjæring.</p>
+<section><strong>2. Kontroller markeringene</strong><p class="small">Røde rektangler er valgt for endring. Klikk et rektangel for å velge eller fjerne det. Programmet endrer enkle SVG-rektangler og lukkede, rettlinjede rektangulære path-former (<code>&lt;rect&gt;</code>). Kurvede stier, transformerte figurer, tapper og kompliserte skjøter blir ikke automatisk endret. Kontroller alltid filen i LightBurn før skjæring.</p>
 <div class="panes"><div><h3>Original</h3><div class="viewer" id="before"></div></div><div><h3>Arbeidskopi</h3><div class="viewer" id="after"></div></div></div></section>
 <section><strong>3. Viktig før skjæring</strong><p>Dette er en første, forsiktig versjon. SVG-en behandles lokalt i nettleseren, uten opplasting til server. Originalen overskrives aldri. Ikke bruk resultatet ukritisk på mekaniske sammenføyninger. Lag et lite testkutt og kontroller tapp/spor-passformen.</p></section></main>
 <script>
@@ -27,13 +27,46 @@ function safeSvg(doc){const copy=doc.documentElement.cloneNode(true);copy.queryS
 function preview(doc,el,interactive){el.replaceChildren();const svg=safeSvg(doc);svg.removeAttribute('width');svg.removeAttribute('height');if(!svg.getAttribute('viewBox')){const w=parseFloat(doc.documentElement.getAttribute('width')),h=parseFloat(doc.documentElement.getAttribute('height'));if(w>0&&h>0)svg.setAttribute('viewBox','0 0 '+w+' '+h)}el.append(svg);if(interactive){svg.querySelectorAll('[data-lf-candidate]').forEach(node=>node.addEventListener('click',()=>{const i=Number(node.getAttribute('data-lf-candidate'));items[i].selected=!items[i].selected;mark();}))}}
 function mark(){const svg=$('after').querySelector('svg');if(!svg)return;svg.querySelectorAll('[data-lf-candidate]').forEach(node=>{const i=Number(node.getAttribute('data-lf-candidate'));node.setAttribute('data-lf-selected',items[i].selected?'yes':'no')});$('apply').disabled=!items.some(x=>x.selected);status(items.filter(x=>x.selected).length+' av '+items.length+' mulige spor valgt.');}
 function scaleToMm(root){const width=root.getAttribute('width')||'',vb=(root.getAttribute('viewBox')||'').trim().split(/[ ,]+/).map(Number);const m=width.match(/^([\d.]+)\s*(mm|cm|in|px|pt)?$/i);if(!m||vb.length!==4||!vb[2]||!m[1])return null;const factor={mm:1,cm:10,in:25.4,px:25.4/96,pt:25.4/72}[m[2]||'px'];return Number(m[1])*factor/vb[2]}
+
+// Detect simple closed, straight-edged path rectangles (including rotated ones).
+function pathRectangle(d){
+ const tokens=(d||'').match(/[a-zA-Z]|[-+]?(?:\d*\.\d+|\d+\.?\d*)(?:e[-+]?\d+)?/gi)||[];
+ if(!tokens.length||!/[zZ]/.test(d)||/[cCsSqQtTaA]/.test(d))return null;
+ let p={x:0,y:0},start=null,points=[],i=0,cmd='';
+ while(i<tokens.length){if(/^[a-zA-Z]$/.test(tokens[i])){cmd=tokens[i++];if(/[zZ]/.test(cmd))break;}if(!cmd||i>=tokens.length)return null;
+ let x=p.x,y=p.y;const read=()=>{const v=Number(tokens[i++]);if(!Number.isFinite(v))throw Error('number');return v};
+ try{switch(cmd){case 'M':x=read();y=read();cmd='L';break;case 'm':x+=read();y+=read();cmd='l';break;case 'L':x=read();y=read();break;case 'l':x+=read();y+=read();break;case 'H':x=read();break;case 'h':x+=read();break;case 'V':y=read();break;case 'v':y+=read();break;default:return null}}catch{return null}
+ p={x,y};points.push(p);if(!start)start=p;if(points.length>8)return null;
+ }
+ if(points.length===5&&Math.hypot(points[0].x-points[4].x,points[0].y-points[4].y)<1e-5)points.pop();
+ if(points.length!==4)return null;
+ const v=(a,b)=>({x:b.x-a.x,y:b.y-a.y}),dot=(a,b)=>a.x*b.x+a.y*b.y,len=a=>Math.hypot(a.x,a.y);
+ const edges=points.map((p,i)=>v(p,points[(i+1)%4])),lens=edges.map(len);
+ if(lens.some(l=>l<1e-6))return null;
+ if(Math.abs(dot(edges[0],edges[1]))/(lens[0]*lens[1])>.015||Math.abs(lens[0]-lens[2])>lens[0]*.015||Math.abs(lens[1]-lens[3])>lens[1]*.015)return null;
+ return {points,lens};
+}
+function pathFromPoints(points){return 'M '+points.map(p=>p.x.toFixed(5)+' '+p.y.toFixed(5)).join(' L ')+' Z'}
+function resizePath(item,newShort){
+ const {points,lens}=item.geometry,shortEdge=lens[0]<=lens[1]?0:1;
+ const center={x:points.reduce((s,p)=>s+p.x,0)/4,y:points.reduce((s,p)=>s+p.y,0)/4};
+ const edge={x:points[(shortEdge+1)%4].x-points[shortEdge].x,y:points[(shortEdge+1)%4].y-points[shortEdge].y};
+ const norm=Math.hypot(edge.x,edge.y),unit={x:edge.x/norm,y:edge.y/norm},ratio=newShort/norm;
+ const next=points.map(p=>{const dx=p.x-center.x,dy=p.y-center.y,proj=dx*unit.x+dy*unit.y;return {x:p.x+unit.x*proj*(ratio-1),y:p.y+unit.y*proj*(ratio-1)}});
+ item.element.setAttribute('d',pathFromPoints(next));
+}
+
 function scan(){if(!originalDoc)return;const old=num('old'),target=num('new'),clear=num('clear'),tol=num('tol');if(!(old>0&&target>0&&tol>=0&&Number.isFinite(clear))){status('Kontroller tallene.');return}
 workingDoc=parse(originalText);items=[];changed=false;const root=workingDoc.documentElement;const mm=scaleToMm(root);if(!mm){status('Kan ikke fastslå mm-skala sikkert. SVG må ha width og viewBox. Ingen endringer gjort.');return}
 const expected=old+clear;root.querySelectorAll('rect').forEach((r)=>{if(r.closest('defs,clipPath,mask,pattern,symbol')||r.hasAttribute('transform')||r.closest('[transform]'))return;const w=Number(r.getAttribute('width')),h=Number(r.getAttribute('height'));if(!(w>0&&h>0))return;const short=Math.min(w,h)*mm,long=Math.max(w,h)*mm;if(Math.abs(short-expected)<=tol&&long>short*1.4){const i=items.length;r.setAttribute('data-lf-candidate',String(i));items.push({element:r,selected:true,axis:w<=h?'width':'height',original:w<=h?w:h})}});
-preview(workingDoc,$('after'),true);mark();$('download').disabled=true;$('reset').disabled=false;status(items.length?'Fant '+items.length+' mulige rektangulære spor. Kontroller markeringene.':'Fant ingen sikre rektangulære spor. Filen kan bruke path-elementer; ingen automatisk endring er gjort.');}
+root.querySelectorAll('path').forEach(r=>{if(r.closest('defs,clipPath,mask,pattern,symbol')||r.hasAttribute('transform')||r.closest('[transform]'))return;
+const geometry=pathRectangle(r.getAttribute('d'));if(!geometry)return;
+const short=Math.min(geometry.lens[0],geometry.lens[1])*mm,long=Math.max(geometry.lens[0],geometry.lens[1])*mm;
+if(Math.abs(short-expected)<=tol&&long>short*1.4){const i=items.length;r.setAttribute('data-lf-candidate',String(i));items.push({element:r,selected:true,kind:'path',geometry})}});
+preview(workingDoc,$('after'),true);mark();$('download').disabled=true;$('reset').disabled=false;status(items.length?'Fant '+items.length+' mulige rektangulære spor (også path). Kontroller markeringene.':'Fant ingen sikre rektangulære spor. Filen kan bruke path-elementer; ingen automatisk endring er gjort.');}
 $('file').addEventListener('change',async e=>{const f=e.target.files[0];if(!f)return;if(f.size>10_000_000){status('Filen er for stor (maks 10 MB).');return}try{originalText=await f.text();originalDoc=parse(originalText);fileName=f.name;preview(originalDoc,$('before'),false);$('scan').disabled=false;$('reset').disabled=false;scan()}catch(err){status('Kunne ikke lese SVG: '+err.message)}});
 $('scan').onclick=scan;
-$('apply').onclick=()=>{if(!workingDoc||!items.length)return;const target=num('new')+num('clear'),mm=scaleToMm(workingDoc.documentElement);if(!(target>0&&mm>0))return;for(const it of items){if(!it.selected)continue;const r=it.element,old=Number(r.getAttribute(it.axis)),next=target/mm,diff=next-old;r.setAttribute(it.axis,String(next));const pos=it.axis==='width'?'x':'y';r.setAttribute(pos,String(Number(r.getAttribute(pos)||0)-diff/2))}workingDoc.documentElement.querySelectorAll('[data-lf-candidate]').forEach(r=>{r.removeAttribute('data-lf-candidate');r.removeAttribute('data-lf-selected')});changed=true;items=[];preview(workingDoc,$('after'),false);$('apply').disabled=true;$('download').disabled=false;status('Endret valgte spor. Kontroller resultatet. For å velge på nytt: trykk «Finn mulige spor».');};
+$('apply').onclick=()=>{if(!workingDoc||!items.length)return;const target=num('new')+num('clear'),mm=scaleToMm(workingDoc.documentElement);if(!(target>0&&mm>0))return;for(const it of items){if(!it.selected)continue;if(it.kind==='path'){resizePath(it,target/mm);continue}const r=it.element,old=Number(r.getAttribute(it.axis)),next=target/mm,diff=next-old;r.setAttribute(it.axis,String(next));const pos=it.axis==='width'?'x':'y';r.setAttribute(pos,String(Number(r.getAttribute(pos)||0)-diff/2))}workingDoc.documentElement.querySelectorAll('[data-lf-candidate]').forEach(r=>{r.removeAttribute('data-lf-candidate');r.removeAttribute('data-lf-selected')});changed=true;items=[];preview(workingDoc,$('after'),false);$('apply').disabled=true;$('download').disabled=false;status('Endret valgte spor. Kontroller resultatet. For å velge på nytt: trykk «Finn mulige spor».');};
 $('download').onclick=()=>{if(!changed)return;const s=new XMLSerializer().serializeToString(workingDoc);const blob=new Blob([s],{type:'image/svg+xml;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=fileName.replace(/\.svg$/i,'')+'_tilpasset_'+num('new')+'mm.svg';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
 $('reset').onclick=()=>{if(originalText){originalDoc=parse(originalText);scan()}};
 </script></body></html>
